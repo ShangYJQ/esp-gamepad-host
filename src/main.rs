@@ -1,11 +1,10 @@
 #![no_std]
 #![no_main]
 
-use embassy_time::{with_timeout, Duration};
 use esp_backtrace as _;
 
 use embassy_executor::Spawner;
-use embassy_usb_host::{descriptor::ConfigurationDescriptor, BusRoute, BusState};
+use embassy_usb_host::{descriptor::ConfigurationDescriptorChain, BusRoute, BusState};
 use esp_hal::{
 	timer::timg::TimerGroup,
 	usb::otg::{embassy_usb_host::Driver, Usb},
@@ -53,14 +52,12 @@ async fn main(_spawner: Spawner) {
 	let mut config_buf = [0u8; 256];
 
 	// 枚举 USB 设备
-	let result = with_timeout(
-		Duration::from_secs(2),
-		bus.enumerate(BusRoute::Direct(speed), &mut config_buf),
-	)
-	.await;
+	let result = bus
+		.enumerate(BusRoute::Direct(speed), &mut config_buf)
+		.await;
 
 	match result {
-		Ok(Ok((enum_info, config_len))) => {
+		Ok((enum_info, config_len)) => {
 			info!(
 				"device enumerated: VID={:04x}, PID={:04x}, addr={}, config_len={}",
 				enum_info.device_desc.vendor_id,
@@ -71,7 +68,7 @@ async fn main(_spawner: Spawner) {
 
 			let config_bytes = &config_buf[..config_len];
 
-			let config = match ConfigurationDescriptor::try_from_slice(config_bytes) {
+			let config = match ConfigurationDescriptorChain::try_from_slice(config_bytes) {
 				Ok(config) => config,
 				Err(e) => {
 					info!("parse configuration failed: {:?}", e);
@@ -109,11 +106,8 @@ async fn main(_spawner: Spawner) {
 			}
 		}
 
-		Ok(Err(e)) => {
+		Err(e) => {
 			info!("enumeration error: {:?}", e);
-		}
-		Err(_) => {
-			info!("enumeration TIMEOUT!");
 		}
 	}
 }

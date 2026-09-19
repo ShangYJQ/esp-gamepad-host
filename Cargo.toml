@@ -10,15 +10,23 @@ bench = false
 
 
 [dependencies]
+embassy-usb-host = { git = "https://github.com/embassy-rs/embassy.git", branch = "main", default-features = false, features = [
+  "log",
+] }
 embassy-executor = "0.10.0"
 embassy-time = "0.5.1"
-embassy-usb-host = { version = "0.1.0", default-features = false, features = ["log"] }
 esp-backtrace = { version = "0.20.0", features = ["esp32s3", "panic-handler", "println"] }
 esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32s3"] }
 esp-hal = { version = "1.2.2", features = ["esp32s3", "log-04", "unstable"] }
 esp-println = { version = "0.18.0", features = ["esp32s3", "log-04"] }
 esp-rtos = { version = "0.4.0", features = ["esp32s3", "embassy", "log-04"] }
 log = "0.4.34"
+
+[patch.crates-io]
+embassy-time = { git = "https://github.com/embassy-rs/embassy.git", branch = "main" }
+embassy-time-driver = { git = "https://github.com/embassy-rs/embassy.git", branch = "main" }
+embassy-time-queue-utils = { git = "https://github.com/embassy-rs/embassy.git", branch = "main" }
+embassy-usb-driver = { git = "https://github.com/embassy-rs/embassy.git", branch = "main" }
 
 [profile.release]
 debug = true

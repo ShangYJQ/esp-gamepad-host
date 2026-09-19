@@ -4,8 +4,8 @@ runner = "espflash flash --monitor"
 rustflags = ["-C", "link-arg=-Wl,-Tlinkall.x", "-C", "link-arg=-nostartfiles"]
 
 [env]
-# ESP_LOG = "info"
-ESP_LOG = "embassy_usb_host=trace,info"
+ESP_LOG = "info"
+# ESP_LOG = "embassy_usb_host=trace,info"
 
 [unstable]
 build-std = ["core", "alloc"]

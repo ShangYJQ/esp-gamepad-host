@@ -13,6 +13,8 @@ bench = false
 embassy-usb-host = { git = "https://github.com/embassy-rs/embassy.git", branch = "main", default-features = false, features = [
   "log",
 ] }
+embassy-usb-driver = "0.2.2"
+embassy-sync = "0.8.0"
 embassy-executor = "0.10.0"
 embassy-time = "0.5.1"
 esp-backtrace = { version = "0.20.0", features = ["esp32s3", "panic-handler", "println"] }
@@ -26,6 +28,7 @@ log = "0.4.34"
 embassy-time = { git = "https://github.com/embassy-rs/embassy.git", branch = "main" }
 embassy-time-driver = { git = "https://github.com/embassy-rs/embassy.git", branch = "main" }
 embassy-time-queue-utils = { git = "https://github.com/embassy-rs/embassy.git", branch = "main" }
+embassy-executor-timer-queue = { git = "https://github.com/embassy-rs/embassy.git", branch = "main" }
 embassy-usb-driver = { git = "https://github.com/embassy-rs/embassy.git", branch = "main" }
 
 [profile.release]

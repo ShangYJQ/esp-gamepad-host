@@ -379,7 +379,7 @@ dependencies = [
  "critical-section",
  "document-features",
  "embassy-executor-macros",
- "embassy-executor-timer-queue 0.1.0",
+ "embassy-executor-timer-queue",
 ]
 
 [[package]]
@@ -393,12 +393,6 @@ dependencies = [
  "quote",
  "syn 2.0.119",
 ]
-
-[[package]]
-name = "embassy-executor-timer-queue"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2fc328bf943af66b80b98755db9106bf7e7471b0cf47dc8559cd9a6be504cc9c"
 
 [[package]]
 name = "embassy-executor-timer-queue"
@@ -521,7 +515,7 @@ name = "embassy-time-queue-utils"
 version = "0.3.2"
 source = "git+https://github.com/embassy-rs/embassy.git?branch=main#d5e5b579ad0d61776887738263c2dd0c3c63d564"
 dependencies = [
- "embassy-executor-timer-queue 0.1.1",
+ "embassy-executor-timer-queue",
  "heapless 0.9.3",
 ]
 
@@ -1025,7 +1019,9 @@ name = "esps3xboxctl"
 version = "0.1.0"
 dependencies = [
  "embassy-executor",
+ "embassy-sync 0.8.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "embassy-time",
+ "embassy-usb-driver",
  "embassy-usb-host",
  "esp-backtrace",
  "esp-bootloader-esp-idf",

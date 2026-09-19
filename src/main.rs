@@ -225,9 +225,10 @@ async fn read_xinput(bus: &HostBus, enum_info: &EnumerationInfo) {
 			}
 			Err(PipeError::Disconnected) => {
 				info!("手柄连接已经断开");
+				return;
 			}
 			Err(e) => {
-				info!("读取失败");
+				info!("读取失败 {:?}", e);
 			}
 		}
 

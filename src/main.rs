@@ -216,11 +216,23 @@ async fn read_xinput(bus: &HostBus, enum_info: &EnumerationInfo) {
 
 	let mut buf = [0u8; 64];
 
+	// 上一包的数据和长度，用来判断这一包有没有变化
+	let mut last = [0u8; 64];
+	let mut last_len = 0;
+
 	loop {
 		match pipe.request_in(&mut buf).await {
 			Ok(n) => {
 				// 直接读取手柄的 xpnut 包
 				let data = &buf[..n];
+
+				// 和上一包一样就跳过，只有数据变了才解析、打印
+				if data == &last[..last_len] {
+					continue;
+				}
+				last[..n].copy_from_slice(data);
+				last_len = n;
+
 				parse_xinput(data);
 			}
 			Err(PipeError::Disconnected) => {

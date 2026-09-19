@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+#[cfg(feature = "rt-led")]
+mod led;
 mod usb_host;
 mod xinput;
 
@@ -35,6 +37,10 @@ async fn main(spawner: Spawner) {
 	// 获得 timg0 硬件时钟组
 	let timg0 = TimerGroup::new(peripherals.TIMG0);
 	esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
+
+	// 板载 RGB 灯 (WS2812) 接在 GPIO48
+	#[cfg(feature = "rt-led")]
+	led::start(spawner, peripherals.RMT, peripherals.GPIO48);
 
 	let usb = Usb::new_fs(
 		peripherals.USB_FS,
@@ -103,15 +109,22 @@ async fn run_gamepad(bus: &HostBus, enum_info: &EnumerationInfo, config: &[u8]) 
 				let report = apply_deadzone(report);
 				if report != last {
 					info!("{}", report);
+					// RT 控制板载灯：0 = 灭，255 = 最亮
+					#[cfg(feature = "rt-led")]
+					led::set_level(report.right_trigger);
 					last = report;
 				}
 			}
 			Err(XInputError::Transfer(PipeError::Disconnected)) => {
 				info!("gamepad disconnected");
+				#[cfg(feature = "rt-led")]
+				led::set_level(0);
 				return;
 			}
 			Err(e) => {
 				warn!("gamepad read error: {}, stop", e);
+				#[cfg(feature = "rt-led")]
+				led::set_level(0);
 				return;
 			}
 		}

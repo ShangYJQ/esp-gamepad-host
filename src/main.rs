@@ -1,20 +1,26 @@
 #![no_std]
 #![no_main]
 
+use embassy_time::Timer;
+use embassy_usb_host::handler::EnumerationInfo;
 use esp_backtrace as _;
 
 use embassy_executor::Spawner;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
-use embassy_usb_driver::host::{DeviceEvent, PipeError, UsbHostController};
-use embassy_usb_driver::Speed;
 use embassy_usb_host::{
 	descriptor::ConfigurationDescriptorChain, BusController, BusHandle, BusRoute, BusState,
 	EnumerationError,
 };
 use esp_hal::{
+	gpio::LpPin,
 	timer::timg::TimerGroup,
 	usb::otg::{embassy_usb_host::Driver, Usb},
+};
+
+use embassy_usb_driver::{
+	host::{pipe, DeviceEvent, PipeError, UsbHostAllocator, UsbHostController, UsbPipe},
+	Direction, EndpointAddress, EndpointInfo, EndpointType, Speed,
 };
 use log::{info, warn};
 
@@ -73,7 +79,18 @@ async fn main(spawner: Spawner) {
 				if let Some(addr) = device_addr.take() {
 					bus.free_address(addr);
 				}
-				device_addr = enumerate_device(&bus, speed).await;
+				// device_addr = enumerate_device(&bus, speed).await;
+
+				if let Some(enum_info) = enumerate_device(&bus, speed).await {
+					device_addr = Some(enum_info.device_address);
+
+					if enum_info.device_desc.vendor_id == 0x045e
+						&& enum_info.device_desc.product_id == 0x028e
+					{
+						info!("------- 识别到 飞智 黑武士 4pro 手柄 --------");
+						read_xinput(&bus, &enum_info).await;
+					}
+				}
 			}
 			DeviceEvent::Disconnected => {
 				info!("usb device disconnected");
@@ -100,7 +117,7 @@ async fn usb_event_task(mut bus_ctrl: HostCtrl) {
 }
 
 /// 枚举刚连上的设备并打印描述符；成功时返回设备地址。
-async fn enumerate_device(bus: &HostBus, speed: Speed) -> Option<u8> {
+async fn enumerate_device(bus: &HostBus, speed: Speed) -> Option<EnumerationInfo> {
 	// 存贮 usb config 介绍
 	let mut config_buf = [0u8; 256];
 
@@ -118,7 +135,7 @@ async fn enumerate_device(bus: &HostBus, speed: Speed) -> Option<u8> {
 				config_len,
 			);
 			print_config(&config_buf[..config_len]);
-			Some(enum_info.device_address)
+			Some(enum_info)
 		}
 		Err(EnumerationError::Transfer(PipeError::Disconnected)) => {
 			// 设备在枚举途中断开 (飞智切换身份时就是这样)，等下一次 Connected 即可
@@ -170,4 +187,116 @@ fn print_config(config_bytes: &[u8]) {
 			);
 		}
 	}
+}
+
+async fn read_xinput(bus: &HostBus, enum_info: &EnumerationInfo) {
+	info!("进入 xinput 模式");
+
+	// 这是刚才描述符里看到的 0x81：
+	// endpoint 1、IN、Interrupt、64 bytes、1ms
+	let ep = EndpointInfo {
+		addr: EndpointAddress::from_parts(1, Direction::In),
+		ep_type: EndpointType::Interrupt,
+		max_packet_size: 64,
+		interval_ms: 1,
+	};
+
+	// 为这个 endpoint 创建一条通信 pipe
+	let mut pipe = match bus.alloc_pipe::<pipe::Interrupt, pipe::In>(
+		enum_info.device_address,
+		&ep,
+		enum_info.split(),
+	) {
+		Ok(pipe) => pipe,
+		Err(e) => {
+			warn!("创建 XInput pipe 失败: {:?}", e);
+			return;
+		}
+	};
+
+	let mut buf = [0u8; 64];
+
+	loop {
+		match pipe.request_in(&mut buf).await {
+			Ok(n) => {
+				// 直接读取手柄的 xpnut 包
+				let data = &buf[..n];
+				parse_xinput(data);
+			}
+			Err(PipeError::Disconnected) => {
+				info!("手柄连接已经断开");
+			}
+			Err(e) => {
+				info!("读取失败");
+			}
+		}
+
+		// Timer::after_millis(10).await;
+	}
+}
+
+fn parse_xinput(data: &[u8]) {
+	if data.len() < 14 {
+		return;
+	}
+
+	if data[0] != 0x00 {
+		info!("unknown xinput packet: {:02x?}", data);
+		return;
+	}
+
+	let dpad_up = data[2] & 0x01 != 0;
+	let dpad_down = data[2] & 0x02 != 0;
+	let dpad_left = data[2] & 0x04 != 0;
+	let dpad_right = data[2] & 0x08 != 0;
+
+	let start = data[2] & 0x10 != 0;
+	let back = data[2] & 0x20 != 0;
+	let l3 = data[2] & 0x40 != 0;
+	let r3 = data[2] & 0x80 != 0;
+
+	let lb = data[3] & 0x01 != 0;
+	let rb = data[3] & 0x02 != 0;
+	let guide = data[3] & 0x04 != 0;
+
+	let a = data[3] & 0x10 != 0;
+	let b = data[3] & 0x20 != 0;
+	let x = data[3] & 0x40 != 0;
+	let y = data[3] & 0x80 != 0;
+
+	let lt = data[4];
+	let rt = data[5];
+
+	let lx = i16::from_le_bytes([data[6], data[7]]);
+	let ly = i16::from_le_bytes([data[8], data[9]]);
+	let rx = i16::from_le_bytes([data[10], data[11]]);
+	let ry = i16::from_le_bytes([data[12], data[13]]);
+
+	info!(
+		"A={} B={} X={} Y={} LB={} RB={} Guide={} \
+		 Start={} Back={} L3={} R3={} \
+		 DPad=[U:{} D:{} L:{} R:{}] \
+		 LT={} RT={} LX={} LY={} RX={} RY={}",
+		a,
+		b,
+		x,
+		y,
+		lb,
+		rb,
+		guide,
+		start,
+		back,
+		l3,
+		r3,
+		dpad_up,
+		dpad_down,
+		dpad_left,
+		dpad_right,
+		lt,
+		rt,
+		lx,
+		ly,
+		rx,
+		ry,
+	);
 }

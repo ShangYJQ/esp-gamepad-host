@@ -1,4 +1,6 @@
-# ESP32-S3 xbox 手柄连接程序
+# esp-gamepad-host
+
+ESP32-S3 作为 USB 主机，读取接入的 USB 手柄输入。
 
 #### 安装和编译
 

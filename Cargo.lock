@@ -742,6 +742,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "esp-gamepad-host"
+version = "0.1.0"
+dependencies = [
+ "embassy-executor",
+ "embassy-sync 0.8.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "embassy-time",
+ "embassy-usb-driver",
+ "embassy-usb-host",
+ "esp-backtrace",
+ "esp-bootloader-esp-idf",
+ "esp-hal",
+ "esp-println",
+ "esp-rtos",
+ "log",
+]
+
+[[package]]
 name = "esp-hal"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1012,23 +1029,6 @@ checksum = "d8b4f101d37c233fe88b2b5e6d27fedab934a52f804e34f52b4b9d4d5ba2ea63"
 dependencies = [
  "critical-section",
  "vcell",
-]
-
-[[package]]
-name = "esps3xboxctl"
-version = "0.1.0"
-dependencies = [
- "embassy-executor",
- "embassy-sync 0.8.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "embassy-time",
- "embassy-usb-driver",
- "embassy-usb-host",
- "esp-backtrace",
- "esp-bootloader-esp-idf",
- "esp-hal",
- "esp-println",
- "esp-rtos",
- "log",
 ]
 
 [[package]]

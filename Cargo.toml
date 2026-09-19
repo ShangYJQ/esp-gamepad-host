@@ -1,10 +1,10 @@
 [package]
-name = "esps3xboxctl"
+name = "esp-gamepad-host"
 version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "esps3xboxctl"
+name = "esp-gamepad-host"
 test = false
 bench = false
 

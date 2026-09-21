@@ -50,24 +50,48 @@ const XINPUT_INPUT_LEN: u8 = 0x14; // 20 字节
 /// 一包的最大长度 (全速中断端点的上限)。
 pub const XINPUT_MAX_PACKET: usize = 64;
 
+// ── XInput output reports ────────────────────────────────────────────────────
+
+/// 震动报告：`00 08 00 <强> <弱> 00 00 00`。
+const XINPUT_MSG_RUMBLE: u8 = 0x00;
+const XINPUT_RUMBLE_LEN: u8 = 0x08;
+/// LED 报告：`01 03 <值>`。
+const XINPUT_MSG_LED: u8 = 0x01;
+const XINPUT_LED_LEN: u8 = 0x03;
+/// LED 值 0 = 全灭。
+const XINPUT_LED_OFF: u8 = 0x00;
+/// LED 值 6–9 = 玩家 1–4 对应扇区常亮。
+const XINPUT_LED_PLAYER_BASE: u8 = 0x06;
+/// 支持的玩家编号上限。
+const XINPUT_PLAYER_MAX: u8 = 4;
+
 // ── Public types ─────────────────────────────────────────────────────────────
 
 // ── Descriptor discovery ─────────────────────────────────────────────────────
 
+/// 一个中断端点。
+#[derive(Clone, Copy, Debug)]
+pub struct InterruptEndpoint {
+	/// 端点地址 (带方向位，例如 0x81)。
+	pub address: u8,
+	/// 最大包长。
+	pub max_packet_size: u16,
+	/// 轮询间隔 (来自端点描述符)。
+	pub interval: u8,
+}
+
 /// 在配置描述符里找到的 XInput 接口信息。
-///
-/// 目前只有中断 IN 端点；OUT 端点等做 LED / 震动时再加。
 #[derive(Clone, Debug)]
 pub struct XInputInterfaceInfo {
-	/// 中断 IN 端点地址 (带方向位，例如 0x81)。
-	pub interrupt_in_ep: u8,
-	/// 中断 IN 端点的最大包长。
-	pub interrupt_in_mps: u16,
-	/// 中断 IN 端点的轮询间隔 (来自端点描述符)。
-	pub interrupt_in_interval: u8,
+	/// 中断 IN 端点，读输入用。
+	pub interrupt_in: InterruptEndpoint,
+	/// 中断 OUT 端点，震动和 LED 用；有的设备不提供。
+	pub interrupt_out: Option<InterruptEndpoint>,
 }
 
 /// 在配置描述符里找 XInput 接口：vendor class 0xFF、subclass 0x5D、protocol 0x01。
+///
+/// 没有中断 IN 端点的接口会被跳过；OUT 端点可有可无。
 pub fn find_xinput(config_desc: &[u8]) -> Option<XInputInterfaceInfo> {
 	let cfg = ConfigurationDescriptorChain::try_from_slice(config_desc).ok()?;
 
@@ -79,14 +103,30 @@ pub fn find_xinput(config_desc: &[u8]) -> Option<XInputInterfaceInfo> {
 			continue;
 		}
 
+		let mut interrupt_in = None;
+		let mut interrupt_out = None;
 		for ep in iface.iter_endpoints() {
-			if ep.transfer_type() == TRANSFER_TYPE_INTERRUPT && ep.is_in() {
-				return Some(XInputInterfaceInfo {
-					interrupt_in_ep: ep.endpoint_address,
-					interrupt_in_mps: ep.max_packet_size,
-					interrupt_in_interval: ep.interval,
-				});
+			if ep.transfer_type() != TRANSFER_TYPE_INTERRUPT {
+				continue;
 			}
+			let found = InterruptEndpoint {
+				address: ep.endpoint_address,
+				max_packet_size: ep.max_packet_size,
+				interval: ep.interval,
+			};
+			// 各方向都只认第一个
+			if ep.is_in() {
+				interrupt_in.get_or_insert(found);
+			} else {
+				interrupt_out.get_or_insert(found);
+			}
+		}
+
+		if let Some(interrupt_in) = interrupt_in {
+			return Some(XInputInterfaceInfo {
+				interrupt_in,
+				interrupt_out,
+			});
 		}
 	}
 
@@ -141,6 +181,8 @@ pub fn parse_standard_input(data: &[u8]) -> Option<GamepadReport> {
 /// 2. 循环调用 [`XInputHost::poll`] 读输入。
 pub struct XInputHost<'d, A: UsbHostAllocator<'d>> {
 	in_ch: A::Pipe<pipe::Interrupt, pipe::In>,
+	/// 震动和 LED 用；设备没有 OUT 端点时是 `None`。
+	out_ch: Option<A::Pipe<pipe::Interrupt, pipe::Out>>,
 	_phantom: PhantomData<&'d ()>,
 }
 
@@ -161,18 +203,41 @@ impl<'d, A: UsbHostAllocator<'d>> XInputHost<'d, A> {
 		let info = find_xinput(config_desc).ok_or(GamepadError::NotSupported)?;
 
 		let in_ep_info = EndpointInfo {
-			addr: EndpointAddress::from_parts((info.interrupt_in_ep & 0x0F) as usize, Direction::In),
+			addr: EndpointAddress::from_parts((info.interrupt_in.address & 0x0F) as usize, Direction::In),
 			ep_type: EndpointType::Interrupt,
-			max_packet_size: info.interrupt_in_mps,
-			interval_ms: info.interrupt_in_interval,
+			max_packet_size: info.interrupt_in.max_packet_size,
+			interval_ms: info.interrupt_in.interval,
 		};
 
 		let in_ch = alloc
 			.alloc_pipe::<pipe::Interrupt, pipe::In>(enum_info.device_address, &in_ep_info, enum_info.split())
 			.map_err(|_| GamepadError::NoPipe)?;
 
+		// 没有 OUT 端点也能用，只是震动和 LED 不可用
+		let out_ch = match info.interrupt_out {
+			Some(ep) => {
+				let out_ep_info = EndpointInfo {
+					addr: EndpointAddress::from_parts((ep.address & 0x0F) as usize, Direction::Out),
+					ep_type: EndpointType::Interrupt,
+					max_packet_size: ep.max_packet_size,
+					interval_ms: ep.interval,
+				};
+				Some(
+					alloc
+						.alloc_pipe::<pipe::Interrupt, pipe::Out>(
+							enum_info.device_address,
+							&out_ep_info,
+							enum_info.split(),
+						)
+						.map_err(|_| GamepadError::NoPipe)?,
+				)
+			}
+			None => None,
+		};
+
 		Ok(Self {
 			in_ch,
+			out_ch,
 			_phantom: PhantomData,
 		})
 	}
@@ -190,5 +255,42 @@ impl<'d, A: UsbHostAllocator<'d>> XInputHost<'d, A> {
 			}
 			debug!("XInput: skip non-input packet ({}B): {:02x?}", n, &buf[..n]);
 		}
+	}
+}
+
+/// XInput 的输出控制。
+///
+/// 目前还没有消费者：这些是给上层用的接口，等 `main.rs` 真的要震动 / 点灯时再接。
+#[allow(dead_code)]
+impl<'d, A: UsbHostAllocator<'d>> XInputHost<'d, A> {
+	// ── 通用控制 (由 crate::gamepad::Gamepad 转发) ────────────────────────────
+
+	/// 设置双马达震动，`strong` 是低频大马达，`weak` 是高频小马达。
+	pub async fn set_rumble(&mut self, strong: u8, weak: u8) -> Result<(), GamepadError> {
+		self.send(&[XINPUT_MSG_RUMBLE, XINPUT_RUMBLE_LEN, 0x00, strong, weak, 0x00, 0x00, 0x00])
+			.await
+	}
+
+	/// 玩家编号指示灯 (1–4，其余值全灭)。
+	///
+	/// Xbox 360 手柄点亮环形灯上对应的扇区。
+	pub async fn set_player_index(&mut self, index: u8) -> Result<(), GamepadError> {
+		let value = if (1..=XINPUT_PLAYER_MAX).contains(&index) {
+			XINPUT_LED_PLAYER_BASE + index - 1
+		} else {
+			XINPUT_LED_OFF
+		};
+		self.send(&[XINPUT_MSG_LED, XINPUT_LED_LEN, value]).await
+	}
+
+	/// 往中断 OUT 端点发一包。
+	///
+	/// # Errors
+	///
+	/// [`GamepadError::NotSupported`]：这个设备的描述符里没有中断 OUT 端点。
+	async fn send(&mut self, packet: &[u8]) -> Result<(), GamepadError> {
+		let out_ch = self.out_ch.as_mut().ok_or(GamepadError::NotSupported)?;
+		out_ch.request_out(packet, true).await?;
+		Ok(())
 	}
 }

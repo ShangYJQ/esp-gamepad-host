@@ -34,8 +34,10 @@
 
 use core::fmt;
 
-use embassy_usb_driver::host::UsbHostAllocator;
+use embassy_usb_driver::host::{pipe, UsbHostAllocator, UsbPipe};
+use embassy_usb_driver::{Direction, EndpointAddress, EndpointInfo, EndpointType};
 use embassy_usb_host::class::hid::HidHost;
+use embassy_usb_host::descriptor::ConfigurationDescriptorChain;
 use embassy_usb_host::handler::EnumerationInfo;
 use log::debug;
 
@@ -89,6 +91,58 @@ const TOUCH_ID: u8 = 0x7F;
 // 状态字节 (偏移 53)
 const STATUS_BATTERY: u8 = 0x0F;
 const STATUS_CHARGE_SHIFT: u8 = 4;
+
+// ── Output report ────────────────────────────────────────────────────────────
+
+/// USB 下的输出报告 ID。
+const DS5_OUTPUT_REPORT_ID: u8 = 0x02;
+/// USB 下输出报告的总长 (含报告 ID)。
+const DS5_OUTPUT_LEN: usize = 63;
+
+// 输出报告里的偏移
+const OUT_FLAG0: usize = 1;
+const OUT_FLAG1: usize = 2;
+const OUT_MOTOR_RIGHT: usize = 3;
+const OUT_MOTOR_LEFT: usize = 4;
+const OUT_MIC_LED: usize = 9;
+const OUT_RIGHT_TRIGGER: usize = 11;
+const OUT_LEFT_TRIGGER: usize = 22;
+const OUT_FLAG2: usize = 39;
+const OUT_LIGHTBAR_SETUP: usize = 42;
+const OUT_LED_BRIGHTNESS: usize = 43;
+const OUT_PLAYER_LEDS: usize = 44;
+const OUT_LIGHTBAR_RGB: usize = 45;
+
+// valid_flag0 (偏移 1)。没置使能位的字段会被整个忽略，而且不报错。
+const FLAG0_COMPATIBLE_VIBRATION: u8 = 1 << 0;
+const FLAG0_HAPTICS_SELECT: u8 = 1 << 1;
+const FLAG0_RIGHT_TRIGGER: u8 = 1 << 2;
+const FLAG0_LEFT_TRIGGER: u8 = 1 << 3;
+
+// valid_flag1 (偏移 2)
+const FLAG1_MIC_LED: u8 = 1 << 0;
+const FLAG1_LIGHTBAR: u8 = 1 << 2;
+const FLAG1_PLAYER_LEDS: u8 = 1 << 4;
+
+// valid_flag2 (偏移 39)
+const FLAG2_LIGHTBAR_SETUP: u8 = 1 << 1;
+const FLAG2_COMPATIBLE_VIBRATION2: u8 = 1 << 2;
+
+/// `lightbar_setup`：掐掉插上时的渐变动画。
+const LIGHTBAR_SETUP_LIGHT_OUT: u8 = 1 << 1;
+
+/// 一个扳机效果块的长度：1 字节模式 + 10 字节参数。
+const TRIGGER_BLOCK_LEN: usize = 11;
+
+// 扳机效果模式
+const TRIGGER_MODE_OFF: u8 = 0x00;
+const TRIGGER_MODE_RIGID: u8 = 0x01;
+const TRIGGER_MODE_PULSE: u8 = 0x02;
+
+/// 扳机行程被分成 10 个位置：0 = 松开，9 = 扣到底。
+const TRIGGER_POS_MAX: u8 = 9;
+/// 阻力力度的上限。
+const TRIGGER_FORCE_MAX: u8 = 8;
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
@@ -182,6 +236,113 @@ impl fmt::Display for Ds5Extra {
 			self.charge_state,
 		)
 	}
+}
+
+/// 自适应扳机的阻力效果。
+///
+/// 扳机行程被分成 10 个位置 (0 = 松开，9 = 扣到底)，这些变体在描述阻力沿行程
+/// 怎么分布。序列化成「1 字节模式 + 10 字节参数」的定长块，简单模式只用到头几个
+/// 参数字节。
+///
+/// 超范围的数值在编码时会被钳到合法区间，不会 panic。
+// Rigid / Pulse 目前没有构造点，同样是等消费者的 API
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TriggerEffect {
+	/// 无阻力，扳机自由。
+	#[default]
+	Off,
+	/// 从 `start` 位置开始一直有阻力，像拉硬弹簧。
+	Rigid {
+		/// 阻力起始位置 (0–9)。
+		start: u8,
+		/// 力度 (0–8)。
+		force: u8,
+	},
+	/// 只在 `start..=end` 这段有阻力，冲过去就松掉，像枪扳机的击发感。
+	Pulse {
+		/// 起点 (0–8)。
+		start: u8,
+		/// 终点，必须在起点之后 (会被钳住)。
+		end: u8,
+		/// 力度 (0–8)。
+		force: u8,
+	},
+}
+
+impl TriggerEffect {
+	/// 写进 11 字节的效果块 (1 字节模式 + 10 字节参数)，多余的参数字节清零。
+	fn encode(self, dst: &mut [u8]) {
+		let dst = &mut dst[..TRIGGER_BLOCK_LEN];
+		dst.fill(0);
+		match self {
+			Self::Off => dst[0] = TRIGGER_MODE_OFF,
+			Self::Rigid { start, force } => {
+				dst[0] = TRIGGER_MODE_RIGID;
+				dst[1] = start.min(TRIGGER_POS_MAX);
+				dst[2] = force.min(TRIGGER_FORCE_MAX);
+			}
+			Self::Pulse { start, end, force } => {
+				// 起点先留出一格，否则下面 clamp 的下界会超过上界
+				let start = start.min(TRIGGER_POS_MAX - 1);
+				dst[0] = TRIGGER_MODE_PULSE;
+				dst[1] = start;
+				dst[2] = end.clamp(start + 1, TRIGGER_POS_MAX);
+				dst[3] = force.min(TRIGGER_FORCE_MAX);
+			}
+		}
+	}
+}
+
+/// DS5 的完整输出状态。
+///
+/// 手柄自己保持状态，只在要改变时发，不需要周期性重发。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Ds5Output {
+	/// 低频大马达 (0–255)。
+	pub rumble_strong: u8,
+	/// 高频小马达 (0–255)。
+	pub rumble_weak: u8,
+	/// 灯条颜色 R / G / B。
+	pub lightbar: [u8; 3],
+	/// 那排 5 颗玩家灯的位图 (bit0–bit4)。
+	pub player_leds: u8,
+	/// 玩家灯亮度：0 = 最亮，数值越大越暗。
+	pub led_brightness: u8,
+	/// 麦克风键上的灯。
+	pub mic_led: bool,
+	/// 左扳机 (L2) 的阻力效果。
+	pub left_trigger: TriggerEffect,
+	/// 右扳机 (R2) 的阻力效果。
+	pub right_trigger: TriggerEffect,
+}
+
+// ── Descriptor discovery ─────────────────────────────────────────────────────
+
+/// HID 接口 class。
+const USB_CLASS_HID: u8 = 0x03;
+/// 中断传输类型。
+const TRANSFER_TYPE_INTERRUPT: u8 = 0x03;
+
+/// 在配置描述符里找 HID 接口的中断 OUT 端点，输出报告走它。
+///
+/// upstream 的 `find_hid` 只找 IN 端点 (它的实现里写死了 `ep.is_in()`)，`HidHost`
+/// 里也没有 OUT 管道，所以这一段得自己走。
+///
+/// 和 `find_hid` 保持一致：只看第一个 HID 接口。
+fn find_hid_out_endpoint(config_desc: &[u8]) -> Option<EndpointInfo> {
+	let cfg = ConfigurationDescriptorChain::try_from_slice(config_desc).ok()?;
+	let iface = cfg.iter_interface().find(|i| i.interface_class == USB_CLASS_HID)?;
+	let ep = iface
+		.iter_endpoints()
+		.find(|ep| ep.transfer_type() == TRANSFER_TYPE_INTERRUPT && !ep.is_in())?;
+
+	Some(EndpointInfo {
+		addr: EndpointAddress::from_parts((ep.endpoint_address & 0x0F) as usize, Direction::Out),
+		ep_type: EndpointType::Interrupt,
+		max_packet_size: ep.max_packet_size,
+		interval_ms: ep.interval,
+	})
 }
 
 // ── Device matching ──────────────────────────────────────────────────────────
@@ -325,6 +486,52 @@ pub fn parse_extra(data: &[u8]) -> Option<Ds5Extra> {
 	})
 }
 
+// ── Output encoding ──────────────────────────────────────────────────────────
+
+/// 玩家编号 → 5 颗玩家灯的位图。
+///
+/// PS5 的习惯是居中亮：玩家 1 只亮中间那颗，玩家 2 亮两侧，依此类推。
+/// 超出 1–5 的编号一律全灭。
+fn player_led_bitmap(index: u8) -> u8 {
+	match index {
+		1 => 0b0_0100,
+		2 => 0b0_1010,
+		3 => 0b1_0101,
+		4 => 0b1_1011,
+		5 => 0b1_1111,
+		_ => 0,
+	}
+}
+
+/// 把输出状态拼成 63 字节的输出报告。
+///
+/// 每类字段都要连同对应的 valid flag 一起置位，否则手柄会静默忽略。这里一次把所有
+/// 使能位都置上、发送完整状态 —— 手柄本来就保持状态，重复下发同样的值没有副作用。
+fn build_output_report(out: &Ds5Output, buf: &mut [u8; DS5_OUTPUT_LEN]) {
+	buf.fill(0);
+	buf[0] = DS5_OUTPUT_REPORT_ID;
+
+	// 振动：先把通路选到振动，再开经典振动模式。
+	// 老固件认 valid_flag0 的 COMPATIBLE_VIBRATION，新固件认 valid_flag2 的 VIBRATION2，
+	// 两个都置上兼容面最大 —— 不认的那一位会被忽略。
+	buf[OUT_FLAG0] |= FLAG0_HAPTICS_SELECT | FLAG0_COMPATIBLE_VIBRATION;
+	buf[OUT_FLAG2] |= FLAG2_COMPATIBLE_VIBRATION2;
+	buf[OUT_MOTOR_LEFT] = out.rumble_strong;
+	buf[OUT_MOTOR_RIGHT] = out.rumble_weak;
+
+	// 灯条 / 玩家灯 / 麦克风灯
+	buf[OUT_FLAG1] |= FLAG1_LIGHTBAR | FLAG1_PLAYER_LEDS | FLAG1_MIC_LED;
+	buf[OUT_LIGHTBAR_RGB..OUT_LIGHTBAR_RGB + 3].copy_from_slice(&out.lightbar);
+	buf[OUT_PLAYER_LEDS] = out.player_leds;
+	buf[OUT_LED_BRIGHTNESS] = out.led_brightness;
+	buf[OUT_MIC_LED] = u8::from(out.mic_led);
+
+	// 自适应扳机
+	buf[OUT_FLAG0] |= FLAG0_LEFT_TRIGGER | FLAG0_RIGHT_TRIGGER;
+	out.right_trigger.encode(&mut buf[OUT_RIGHT_TRIGGER..]);
+	out.left_trigger.encode(&mut buf[OUT_LEFT_TRIGGER..]);
+}
+
 // ── Ds5Host driver ───────────────────────────────────────────────────────────
 
 /// DS5 host class driver。
@@ -333,9 +540,13 @@ pub fn parse_extra(data: &[u8]) -> Option<Ds5Extra> {
 ///
 /// 1. USB 枚举完成后调用 [`Ds5Host::try_register`]。
 /// 2. 循环调用 [`Ds5Host::poll`] 读输入；DS5 特有的数据在 [`Ds5Host::extra`]。
+/// 3. 震动 / 灯条 / 扳机用各个 `set_*`，或者 [`Ds5Host::set_output`] 一次设完。
 pub struct Ds5Host<'d, A: UsbHostAllocator<'d>> {
 	hid: HidHost<'d, A>,
+	/// 输出报告用；描述符里没有中断 OUT 端点时是 `None`。
+	out_ch: Option<A::Pipe<pipe::Interrupt, pipe::Out>>,
 	extra: Ds5Extra,
+	output: Ds5Output,
 }
 
 impl<'d, A: UsbHostAllocator<'d>> Ds5Host<'d, A> {
@@ -352,9 +563,27 @@ impl<'d, A: UsbHostAllocator<'d>> Ds5Host<'d, A> {
 			return Err(GamepadError::NotSupported);
 		}
 
+		let hid = HidHost::new(alloc, config_desc, enum_info)?;
+
+		// 没有 OUT 端点也能用，只是输出控制不可用
+		let out_ch = match find_hid_out_endpoint(config_desc) {
+			Some(out_ep_info) => Some(
+				alloc
+					.alloc_pipe::<pipe::Interrupt, pipe::Out>(
+						enum_info.device_address,
+						&out_ep_info,
+						enum_info.split(),
+					)
+					.map_err(|_| GamepadError::NoPipe)?,
+			),
+			None => None,
+		};
+
 		Ok(Self {
-			hid: HidHost::new(alloc, config_desc, enum_info)?,
+			hid,
+			out_ch,
 			extra: Ds5Extra::default(),
+			output: Ds5Output::default(),
 		})
 	}
 
@@ -383,5 +612,107 @@ impl<'d, A: UsbHostAllocator<'d>> Ds5Host<'d, A> {
 	#[allow(dead_code)]
 	pub fn extra(&self) -> &Ds5Extra {
 		&self.extra
+	}
+}
+
+/// DS5 的输出控制。
+///
+/// 目前还没有消费者：这些是给上层用的接口，等 `main.rs` 真的要震动 / 点灯时再接。
+#[allow(dead_code)]
+impl<'d, A: UsbHostAllocator<'d>> Ds5Host<'d, A> {
+	// ── 通用控制 (由 crate::gamepad::Gamepad 转发) ────────────────────────────
+
+	/// 设置双马达震动，`strong` 是低频大马达，`weak` 是高频小马达。
+	pub async fn set_rumble(&mut self, strong: u8, weak: u8) -> Result<(), GamepadError> {
+		let mut out = self.output;
+		out.rumble_strong = strong;
+		out.rumble_weak = weak;
+		self.set_output(out).await
+	}
+
+	/// 玩家编号指示灯 (1–5，其余值全灭)。
+	pub async fn set_player_index(&mut self, index: u8) -> Result<(), GamepadError> {
+		let mut out = self.output;
+		out.player_leds = player_led_bitmap(index);
+		self.set_output(out).await
+	}
+
+	// ── DS5 独有 ─────────────────────────────────────────────────────────────
+
+	/// 灯条颜色。
+	///
+	/// 手柄刚插上会播一段渐变动画，期间设的颜色会被盖掉；要立刻生效先调一次
+	/// [`Ds5Host::stop_lightbar_animation`]。
+	pub async fn set_lightbar(&mut self, r: u8, g: u8, b: u8) -> Result<(), GamepadError> {
+		let mut out = self.output;
+		out.lightbar = [r, g, b];
+		self.set_output(out).await
+	}
+
+	/// 麦克风键上的灯。
+	pub async fn set_mic_led(&mut self, on: bool) -> Result<(), GamepadError> {
+		let mut out = self.output;
+		out.mic_led = on;
+		self.set_output(out).await
+	}
+
+	/// 两个扳机的阻力效果。
+	///
+	/// 这部分 Linux 内核完全没实现 (那 28 字节在内核里就叫 `reserved2`)，参数语义
+	/// 是社区逆向的，手感对不对得上机实测。
+	pub async fn set_trigger_effects(
+		&mut self,
+		left: TriggerEffect,
+		right: TriggerEffect,
+	) -> Result<(), GamepadError> {
+		let mut out = self.output;
+		out.left_trigger = left;
+		out.right_trigger = right;
+		self.set_output(out).await
+	}
+
+	/// 掐掉插上时的灯条渐变动画。
+	///
+	/// 单独发一包只带 `lightbar_setup` 的报告，不动当前输出状态。
+	///
+	/// **没在实机上验证过**：这一位的语义是社区逆向的，内核没碰。如果调完灯条直接
+	/// 灭了而不是接管成功，那就是这一位理解反了，去掉这个调用即可。
+	pub async fn stop_lightbar_animation(&mut self) -> Result<(), GamepadError> {
+		let mut buf = [0u8; DS5_OUTPUT_LEN];
+		buf[0] = DS5_OUTPUT_REPORT_ID;
+		buf[OUT_FLAG2] = FLAG2_LIGHTBAR_SETUP;
+		buf[OUT_LIGHTBAR_SETUP] = LIGHTBAR_SETUP_LIGHT_OUT;
+		self.send(&buf).await
+	}
+
+	/// 一次性设置完整输出状态。
+	///
+	/// 分项的 setter 内部都走这里；要同时改好几项时直接调它，省掉多余的 USB 往返。
+	pub async fn set_output(&mut self, out: Ds5Output) -> Result<(), GamepadError> {
+		let mut buf = [0u8; DS5_OUTPUT_LEN];
+		build_output_report(&out, &mut buf);
+		self.send(&buf).await?;
+		// 发成功了才记下来，失败时状态不至于和手柄对不上
+		self.output = out;
+		Ok(())
+	}
+
+	/// 当前的输出状态。
+	pub fn output(&self) -> &Ds5Output {
+		&self.output
+	}
+
+	/// 把输出报告发出去，走中断 OUT 端点。
+	///
+	/// 不能用控制端点的 `SET_REPORT`：实测 DS5 对它回 STALL。中断 OUT 也是 Linux
+	/// `hid-playstation` 走的路径。
+	///
+	/// # Errors
+	///
+	/// [`GamepadError::NotSupported`]：描述符里没有中断 OUT 端点。
+	async fn send(&mut self, buf: &[u8]) -> Result<(), GamepadError> {
+		let out_ch = self.out_ch.as_mut().ok_or(GamepadError::NotSupported)?;
+		out_ch.request_out(buf, true).await?;
+		Ok(())
 	}
 }

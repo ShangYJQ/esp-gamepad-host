@@ -117,7 +117,8 @@ impl fmt::Display for GamepadReport {
 pub enum GamepadError {
 	/// USB 传输错误 (设备拔出时是 `PipeError::Disconnected`)。
 	Transfer(PipeError),
-	/// 这个设备不归这家 driver 管：接口对不上，或者 VID/PID 不匹配。
+	/// 这个设备不归这家 driver 管 (接口对不上、VID/PID 不匹配)，或者不支持这个操作
+	/// (比如描述符里没有输出端点，就没法震动)。
 	///
 	/// 分发时靠它决定要不要往下试，所以和真正的错误分开。
 	NotSupported,
@@ -206,6 +207,51 @@ impl<'d, A: UsbHostAllocator<'d>> Gamepad<'d, A> {
 		match self {
 			Self::XInput(pad) => pad.poll().await,
 			Self::Ds5(pad) => pad.poll().await,
+		}
+	}
+}
+
+/// 设备无关的输出控制。
+impl<'d, A: UsbHostAllocator<'d>> Gamepad<'d, A> {
+	// ── 通用控制 ─────────────────────────────────────────────────────────────
+	//
+	// 这里只放两家都有对应物的东西。DS5 独有的 (灯条 RGB、自适应扳机、麦克风灯)
+	// 挂在 crate::ds5::Ds5Host 上，要用就 match 出 Gamepad::Ds5 分支。
+
+	/// 设置双马达震动。
+	///
+	/// `strong` 是低频大马达，`weak` 是高频小马达，都是 0–255。
+	///
+	/// 手柄自己保持状态，**只在要改变时调用** —— 跟着每个输入包发会把总线流量翻倍，
+	/// 而且两家的 OUT 端点 interval 都只有 4ms。
+	///
+	/// # Errors
+	///
+	/// [`GamepadError::NotSupported`]：这个设备没有可用的输出端点。
+	pub async fn set_rumble(&mut self, strong: u8, weak: u8) -> Result<(), GamepadError> {
+		match self {
+			Self::XInput(pad) => pad.set_rumble(strong, weak).await,
+			Self::Ds5(pad) => pad.set_rumble(strong, weak).await,
+		}
+	}
+
+	/// 停掉所有震动。
+	pub async fn stop_rumble(&mut self) -> Result<(), GamepadError> {
+		self.set_rumble(0, 0).await
+	}
+
+	/// 玩家编号指示灯，0 = 全灭。
+	///
+	/// XInput 点亮环形灯的对应扇区 (支持 1–4)，DS5 点亮那排 5 颗灯里对应的组合
+	/// (支持 1–5)。超出范围的编号一律全灭。
+	///
+	/// # Errors
+	///
+	/// [`GamepadError::NotSupported`]：这个设备没有可用的输出端点。
+	pub async fn set_player_index(&mut self, index: u8) -> Result<(), GamepadError> {
+		match self {
+			Self::XInput(pad) => pad.set_player_index(index).await,
+			Self::Ds5(pad) => pad.set_player_index(index).await,
 		}
 	}
 }

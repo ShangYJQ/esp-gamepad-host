@@ -1,7 +1,13 @@
 [target.'cfg(target_arch = "xtensa")']
 runner = "espflash flash --monitor"
 
-rustflags = ["-C", "link-arg=-Wl,-Tlinkall.x", "-C", "link-arg=-nostartfiles"]
+rustflags = [
+	"-C", "link-arg=-Wl,-Tlinkall.x",
+	"-C", "link-arg=-nostartfiles",
+	# .rotext_dummy (W) 和 .text (X) 被 ld 归进同一个 LOAD segment，
+	# 裸机固件上 RWX 无意义，关掉 binutils 2.39+ 默认的这条警告
+	"-C", "link-arg=-Wl,--no-warn-rwx-segments",
+]
 
 [env]
 ESP_LOG = "info"

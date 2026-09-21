@@ -3,6 +3,8 @@
 //! 组织方式参考 embassy-usb-host 的 `class/gip.rs`：
 //! 常量 → 公开类型 → 描述符查找 → 纯解析函数 → 驱动。
 //!
+//! 解析结果归一到 [`crate::gamepad::GamepadReport`]。
+//!
 //! 目前适配：飞智 黑武士 4 Pro 的 XInput 模式 (`045e:028e`)。
 //!
 //! # 输入报告格式
@@ -23,14 +25,15 @@
 //!
 //! 飞智 黑武士 4 Pro 实际每包发 32 字节，第 14–31 字节是它自己的扩展数据，这里先不解析。
 
-use core::fmt;
 use core::marker::PhantomData;
 
-use embassy_usb_driver::host::{pipe, PipeError, UsbHostAllocator, UsbPipe};
+use embassy_usb_driver::host::{pipe, UsbHostAllocator, UsbPipe};
 use embassy_usb_driver::{Direction, EndpointAddress, EndpointInfo, EndpointType};
 use embassy_usb_host::descriptor::ConfigurationDescriptorChain;
 use embassy_usb_host::handler::EnumerationInfo;
 use log::debug;
+
+use crate::gamepad::{GamepadError, GamepadReport};
 
 // ── XInput USB interface identifiers ─────────────────────────────────────────
 
@@ -48,130 +51,6 @@ const XINPUT_INPUT_LEN: u8 = 0x14; // 20 字节
 pub const XINPUT_MAX_PACKET: usize = 64;
 
 // ── Public types ─────────────────────────────────────────────────────────────
-
-/// 解析后的 XInput 输入报告。
-///
-/// 数值都是协议原始范围：扳机 0–255，摇杆 −32768–32767。
-/// 字段名和 upstream GIP 的 `GamepadReport` 保持一致。
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct GamepadReport {
-	/// 方向键上。
-	pub dpad_up: bool,
-	/// 方向键下。
-	pub dpad_down: bool,
-	/// 方向键左。
-	pub dpad_left: bool,
-	/// 方向键右。
-	pub dpad_right: bool,
-	/// A 键。
-	pub a: bool,
-	/// B 键。
-	pub b: bool,
-	/// X 键。
-	pub x: bool,
-	/// Y 键。
-	pub y: bool,
-	/// 左肩键 (LB)。
-	pub left_bumper: bool,
-	/// 右肩键 (RB)。
-	pub right_bumper: bool,
-	/// 左摇杆按下 (LS / L3)。
-	pub left_stick_press: bool,
-	/// 右摇杆按下 (RS / R3)。
-	pub right_stick_press: bool,
-	/// Start 键。
-	pub start: bool,
-	/// Back 键。
-	pub back: bool,
-	/// Guide 键 (中间的 Xbox 键)。
-	pub guide: bool,
-	/// 左扳机 (0–255)。
-	pub left_trigger: u8,
-	/// 右扳机 (0–255)。
-	pub right_trigger: u8,
-	/// 左摇杆 X (−32768–32767，正数 = 右)。
-	pub left_stick_x: i16,
-	/// 左摇杆 Y (−32768–32767，正数 = 上)。
-	pub left_stick_y: i16,
-	/// 右摇杆 X (−32768–32767，正数 = 右)。
-	pub right_stick_x: i16,
-	/// 右摇杆 Y (−32768–32767，正数 = 上)。
-	pub right_stick_y: i16,
-}
-
-impl fmt::Display for GamepadReport {
-	/// 例如：`buttons=[A LB] LT=0 RT=255 L=(0, 0) R=(12000, -9000)`
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		let buttons = [
-			(self.a, "A"),
-			(self.b, "B"),
-			(self.x, "X"),
-			(self.y, "Y"),
-			(self.left_bumper, "LB"),
-			(self.right_bumper, "RB"),
-			(self.left_stick_press, "LS"),
-			(self.right_stick_press, "RS"),
-			(self.start, "Start"),
-			(self.back, "Back"),
-			(self.guide, "Guide"),
-			(self.dpad_up, "Up"),
-			(self.dpad_down, "Down"),
-			(self.dpad_left, "Left"),
-			(self.dpad_right, "Right"),
-		];
-
-		write!(f, "buttons=[")?;
-		let mut first = true;
-		for (pressed, name) in buttons {
-			if pressed {
-				if !first {
-					write!(f, " ")?;
-				}
-				f.write_str(name)?;
-				first = false;
-			}
-		}
-		write!(
-			f,
-			"] LT={} RT={} L=({}, {}) R=({}, {})",
-			self.left_trigger,
-			self.right_trigger,
-			self.left_stick_x,
-			self.left_stick_y,
-			self.right_stick_x,
-			self.right_stick_y,
-		)
-	}
-}
-
-/// XInput host class driver 的错误。
-#[derive(Debug)]
-pub enum XInputError {
-	/// USB 传输错误 (设备拔出时是 `PipeError::Disconnected`)。
-	Transfer(PipeError),
-	/// 配置描述符里没有 XInput 接口。
-	NoInterface,
-	/// 没有空闲的 USB pipe。
-	NoPipe,
-}
-
-impl From<PipeError> for XInputError {
-	fn from(e: PipeError) -> Self {
-		Self::Transfer(e)
-	}
-}
-
-impl fmt::Display for XInputError {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		match self {
-			Self::Transfer(e) => write!(f, "Transfer error: {:?}", e),
-			Self::NoInterface => write!(f, "No XInput interface found"),
-			Self::NoPipe => write!(f, "No free pipe"),
-		}
-	}
-}
-
-impl core::error::Error for XInputError {}
 
 // ── Descriptor discovery ─────────────────────────────────────────────────────
 
@@ -272,14 +151,14 @@ impl<'d, A: UsbHostAllocator<'d>> XInputHost<'d, A> {
 	///
 	/// # Errors
 	///
-	/// - [`XInputError::NoInterface`]：描述符里没有 XInput 接口。
-	/// - [`XInputError::NoPipe`]：没有空闲的 pipe。
+	/// - [`GamepadError::NotSupported`]：描述符里没有 XInput 接口。
+	/// - [`GamepadError::NoPipe`]：没有空闲的 pipe。
 	pub async fn try_register(
 		alloc: &A,
 		config_desc: &[u8],
 		enum_info: &EnumerationInfo,
-	) -> Result<Self, XInputError> {
-		let info = find_xinput(config_desc).ok_or(XInputError::NoInterface)?;
+	) -> Result<Self, GamepadError> {
+		let info = find_xinput(config_desc).ok_or(GamepadError::NotSupported)?;
 
 		let in_ep_info = EndpointInfo {
 			addr: EndpointAddress::from_parts((info.interrupt_in_ep & 0x0F) as usize, Direction::In),
@@ -290,7 +169,7 @@ impl<'d, A: UsbHostAllocator<'d>> XInputHost<'d, A> {
 
 		let in_ch = alloc
 			.alloc_pipe::<pipe::Interrupt, pipe::In>(enum_info.device_address, &in_ep_info, enum_info.split())
-			.map_err(|_| XInputError::NoPipe)?;
+			.map_err(|_| GamepadError::NoPipe)?;
 
 		Ok(Self {
 			in_ch,
@@ -302,7 +181,7 @@ impl<'d, A: UsbHostAllocator<'d>> XInputHost<'d, A> {
 	///
 	/// 不是输入报告的包 (比如刚连上时的 LED 状态包 `01 03 xx`) 在内部跳过，
 	/// 直到读到一包有效的输入才返回。
-	pub async fn poll(&mut self) -> Result<GamepadReport, XInputError> {
+	pub async fn poll(&mut self) -> Result<GamepadReport, GamepadError> {
 		let mut buf = [0u8; XINPUT_MAX_PACKET];
 		loop {
 			let n = self.in_ch.request_in(&mut buf).await?;

@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+mod ds5;
+mod gamepad;
 #[cfg(feature = "rt-led")]
 mod led;
 mod usb_host;
@@ -14,8 +16,8 @@ use embassy_usb_host::handler::EnumerationInfo;
 use esp_hal::{timer::timg::TimerGroup, usb::otg::Usb};
 use log::{info, warn};
 
+use crate::gamepad::{Gamepad, GamepadError, GamepadReport};
 use crate::usb_host::HostBus;
-use crate::xinput::{GamepadReport, XInputError, XInputHost};
 
 // 使用这个宏来 定义固件信息
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -65,7 +67,8 @@ async fn main(spawner: Spawner) {
 				}
 
 				// 配置描述符要一直留着，交给 class driver 找接口和端点
-				let mut config_buf = [0u8; 256];
+				// DS5 带内置音频，配置描述符里还有 UAC 接口，256 不够
+				let mut config_buf = [0u8; 512];
 				if let Some((enum_info, config_len)) = usb_host::enumerate(&bus, speed, &mut config_buf).await {
 					device_addr = Some(enum_info.device_address);
 					run_gamepad(&bus, &enum_info, &config_buf[..config_len]).await;
@@ -82,23 +85,24 @@ async fn main(spawner: Spawner) {
 	}
 }
 
-/// 如果设备是 XInput 手柄 (目前适配：飞智 黑武士 4 Pro 的 XInput 模式)，
-/// 就一直读输入，直到断开或出错。
+/// 如果设备是认得出的手柄 (XInput 或 DualSense)，就一直读输入，直到断开或出错。
 async fn run_gamepad(bus: &HostBus, enum_info: &EnumerationInfo, config: &[u8]) {
-	let mut pad = match XInputHost::try_register(bus, config, enum_info).await {
+	let mut pad = match Gamepad::try_register(bus, config, enum_info).await {
 		Ok(pad) => pad,
-		Err(XInputError::NoInterface) => {
-			info!("not an XInput device, ignored");
+		Err(GamepadError::NotSupported) => {
+			info!("not a supported gamepad, ignored");
 			return;
 		}
 		Err(e) => {
-			warn!("XInput register failed: {}", e);
+			warn!("gamepad register failed: {}", e);
 			return;
 		}
 	};
 	info!(
-		"XInput gamepad ready: VID={:04x} PID={:04x}",
-		enum_info.device_desc.vendor_id, enum_info.device_desc.product_id,
+		"{} gamepad ready: VID={:04x} PID={:04x}",
+		pad.protocol(),
+		enum_info.device_desc.vendor_id,
+		enum_info.device_desc.product_id,
 	);
 
 	let mut last = GamepadReport::default();
@@ -115,7 +119,7 @@ async fn run_gamepad(bus: &HostBus, enum_info: &EnumerationInfo, config: &[u8]) 
 					last = report;
 				}
 			}
-			Err(XInputError::Transfer(PipeError::Disconnected)) => {
+			Err(GamepadError::Transfer(PipeError::Disconnected)) => {
 				info!("gamepad disconnected");
 				#[cfg(feature = "rt-led")]
 				led::set_level(0);
